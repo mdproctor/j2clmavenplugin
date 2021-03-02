@@ -1,33 +1,39 @@
 package net.cardosi.mojo.cache;
 
-import com.google.common.base.Preconditions;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.j2cl.common.SourceUtils;
-import com.google.j2cl.transpiler.incremental.ChangeSet;
-import com.google.j2cl.transpiler.incremental.TypeGraphStore;
-import com.google.j2cl.transpiler.incremental.TypeInfo;
-import com.google.javascript.jscomp.*;
-import net.cardosi.mojo.ClosureBuildConfiguration;
-import net.cardosi.mojo.Hash;
-import net.cardosi.mojo.tools.*;
-import org.apache.commons.io.FileUtils;
-import org.apache.maven.artifact.Artifact;
-import org.apache.maven.artifact.ArtifactUtils;
-import org.apache.maven.artifact.resolver.filter.ScopeArtifactFilter;
-import org.apache.maven.model.FileSet;
-import org.apache.maven.model.Resource;
-import org.apache.maven.project.MavenProject;
-
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URI;
-import java.nio.file.*;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.FileVisitResult;
+import java.nio.file.FileVisitor;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.PathMatcher;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
+import java.nio.file.Watchable;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -36,58 +42,62 @@ import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import com.google.common.base.Preconditions;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.j2cl.common.SourceUtils;
+import com.google.j2cl.transpiler.incremental.ChangeSet;
+import com.google.j2cl.transpiler.incremental.TypeGraphStore;
+import com.google.j2cl.transpiler.incremental.TypeInfo;
+import com.google.javascript.jscomp.CompilerOptions.LanguageMode;
+import com.google.javascript.jscomp.CompilationLevel;
+import com.google.javascript.jscomp.DependencyOptions;
+import com.google.javascript.jscomp.PersistentInputStore;
+import io.methvin.watchservice.MacOSXListeningWatchService;
+import io.methvin.watchservice.WatchablePath;
+import net.cardosi.mojo.ClosureBuildConfiguration;
+import net.cardosi.mojo.Hash;
+import net.cardosi.mojo.tools.Closure;
+import net.cardosi.mojo.tools.GwtIncompatiblePreprocessor;
+import net.cardosi.mojo.tools.J2cl;
+import net.cardosi.mojo.tools.Javac;
+import net.cardosi.mojo.tools.JsChecker;
+import org.apache.commons.io.FileUtils;
+import org.apache.maven.artifact.Artifact;
+import org.apache.maven.artifact.ArtifactUtils;
+import org.apache.maven.artifact.resolver.filter.ScopeArtifactFilter;
+import org.apache.maven.model.FileSet;
+import org.apache.maven.model.Resource;
+import org.apache.maven.project.MavenProject;
+
 public class CachedProject {
+
     public static final String BUNDLE_JAR = "BUNDLE_JAR";
     private static final String BUNDLE_JAR_BASE_FILE = "j2cl-base.js";
-    private enum Step {
-        Hash,
-        ChangeSet,
-        ProcessAnnotations,
-        StripGwtIncompatible,
-        GenerateStrippedBytecode,
-        TranspileSources,
-
-        AssembleOutput,
-
-        // these names could be clearer
-        JsChecker,
-        ProjectBundle,
-        ChunkBundle,
-    }
-
     private static final PathMatcher javaMatcher = FileSystems.getDefault().getPathMatcher("glob:**/*.java");
     private static final PathMatcher jsMatcher = FileSystems.getDefault().getPathMatcher("glob:**/*.js");
     private static final PathMatcher nativeJsMatcher = FileSystems.getDefault().getPathMatcher("glob:**/*.native.js");
-
     private final DiskCache diskCache;
-    private Artifact artifact;
-    private MavenProject currentProject;
-    private List<CachedProject> children;
     private final List<CachedProject> dependents = new ArrayList<>();
     private final List<String> compileSourceRoots;
     private final List<Resource> resources;
-    private       TypeGraphStore typeGraphStore;
-
-    TranspiledCacheEntry transpiledCacheEntry;
-
     private final Map<String, CompletableFuture<TranspiledCacheEntry>> steps = new ConcurrentHashMap<>();
-
+    private Artifact artifact;
+    private MavenProject currentProject;
+    private List<CachedProject> children;
+    private TypeGraphStore typeGraphStore;
+    private TranspiledCacheEntry transpiledCacheEntry;
     private Set<Supplier<CompletableFuture<TranspiledCacheEntry>>> registeredBuildTerminals = new HashSet<>();
-
-    public CachedProject(DiskCache diskCache, Artifact artifact, MavenProject currentProject, List<CachedProject> children,
-                         List<String> compileSourceRoots, List<Resource> resources) {
-        this.diskCache = diskCache;
-        this.compileSourceRoots = compileSourceRoots;
-        this.resources = resources;
-        replace(artifact, currentProject, children);
-    }
 
     public CachedProject(DiskCache diskCache, Artifact artifact, MavenProject currentProject, List<CachedProject> children) {
         this(diskCache, artifact, currentProject, children, currentProject.getCompileSourceRoots(), currentProject.getResources());
     }
 
-    public List<String> getCompileSourceRoots() {
-        return compileSourceRoots;
+    public CachedProject(DiskCache diskCache, Artifact artifact, MavenProject currentProject, List<CachedProject> children, List<String> compileSourceRoots, List<Resource> resources) {
+        this.diskCache = diskCache;
+        this.compileSourceRoots = compileSourceRoots;
+        this.resources = resources;
+        replace(artifact, currentProject, children);
     }
 
     public void replace(Artifact artifact, MavenProject currentProject, List<CachedProject> children) {
@@ -102,17 +112,59 @@ public class CachedProject {
         }
     }
 
+    static void copyFolder(File src, File dest) {
+        try {
+            FileUtils.copyDirectory(src, dest);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return;
+    }
+
+    private static void appendHashOfAllSources(Hash hash, Path rootDirectory) throws IOException {
+        // TODO filter to only source files - probably will just blacklist .class files?
+
+        // If no sources are found, we still need to consider this as a provided classpath item, but the
+        // stripped jar will be empty, etc
+        Files.walkFileTree(rootDirectory, new FileVisitor<Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes basicFileAttributes) throws IOException {
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path path, BasicFileAttributes basicFileAttributes) throws IOException {
+                hash.append(Files.readAllBytes(path));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path path, IOException e) throws IOException {
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path path, IOException e) throws IOException {
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    public List<String> getCompileSourceRoots() {
+        return compileSourceRoots;
+    }
+
     /**
      * Indicates that some source has changed and at the very least the hash should be recomputed, which implies that
      * downstream projects too should be updated. Used to forward-propagate changes through the graph, when they get
      * to a root (compiled app or test), that will actually trigger the compilation to take place as needed.
-     *
+     * <p>
      * TODO this could be updated to compare before/after hash and avoid marking children as dirty
      */
-    public void markDirty() {
+    public CompletableFuture<Void> markDirty() {
         synchronized (steps) {
             if (steps.isEmpty()) {
-                return;
+                return null;
             }
             // cancel all running work
             for (CompletableFuture<TranspiledCacheEntry> cf : steps.values()) {
@@ -137,24 +189,22 @@ public class CachedProject {
 
         //TODO cache those "compile me" or "test me" values so we don't pass around like this
         if (!registeredBuildTerminals.isEmpty()) {
-            build();
+            return build();
         }
+        return null;
     }
 
     //TODO instead of these, consider a .test() method instead?
     public MavenProject getMavenProject() {
         return currentProject;
     }
+
     public List<CachedProject> getChildren() {
         return Collections.unmodifiableList(children);
     }
 
     public String getArtifactId() {
         return artifact.getArtifactId();
-    }
-
-    public String getArtifactKey() {
-        return ArtifactUtils.key(artifact);
     }
 
     public Artifact getArtifact() {
@@ -171,46 +221,13 @@ public class CachedProject {
                 '}';
     }
 
+    public String getArtifactKey() {
+        return ArtifactUtils.key(artifact);
+    }
+
     public boolean hasSourcesMapped() {
         //TODO should eventually support external artifact source dirs so we can watch that instead of using jars
         return !compileSourceRoots.isEmpty();
-    }
-
-    public void watch() throws IOException {
-        Map<FileSystem, List<Path>> fileSystemsToWatch = compileSourceRoots.stream().map(Paths::get).collect(Collectors.groupingBy(Path::getFileSystem));
-        for (Map.Entry<FileSystem, List<Path>> entry : fileSystemsToWatch.entrySet()) {
-            WatchService watchService = entry.getKey().newWatchService();
-            for (Path path : entry.getValue()) {
-                Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
-                    @Override
-                    public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes basicFileAttributes) throws IOException {
-                        path.register(watchService, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_DELETE, StandardWatchEventKinds.ENTRY_MODIFY);
-                        return FileVisitResult.CONTINUE;
-                    }
-                });
-                path.register(watchService, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_DELETE, StandardWatchEventKinds.ENTRY_MODIFY);
-            }
-            new Thread() {
-                @Override
-                public void run() {
-                    while (true) {
-                        try {
-                            WatchKey key = watchService.poll(10, TimeUnit.SECONDS);
-                            if (key == null) {
-                                continue;
-                            }
-                            //TODO if it was a create, register it (recursively?)
-                            key.pollEvents();//clear the events out
-                            key.reset();//reset to go again
-                            markDirty();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
-                    }
-                }
-            }.start();
-        }
     }
 
     public CompletableFuture<TranspiledCacheEntry> registerAsApp(ClosureBuildConfiguration config) {
@@ -265,8 +282,10 @@ public class CachedProject {
                 while (!stepDir.mkdir()) {
                     // wait for complete/failed markers, if either exists, we can bail early
                     Path stepDirPath = stepDir.toPath();
-                    try (WatchService w = stepDirPath.getFileSystem().newWatchService()) {
-                        stepDirPath.register(w, StandardWatchEventKinds.ENTRY_CREATE);
+                    try (WatchService w = createWatchService()) {
+                        registerWatch(stepDirPath, w);
+                        //try (WatchService w = stepDirPath.getFileSystem().newWatchService()) {
+                        //    stepDirPath.register(w, StandardWatchEventKinds.ENTRY_CREATE);
                         // first check to see if it exists, then wait for next event to occur
                         do {
                             if (!stepDir.exists()) {
@@ -290,7 +309,6 @@ public class CachedProject {
                             if (key != null) {
                                 key.reset();
                             }
-
                         } while (true);
                     } catch (NoSuchFileException ex) {
                         // in this case, someone else canceled their work and deleted stepDir itself, causing an exception
@@ -325,6 +343,22 @@ public class CachedProject {
                 }).join();
             }, diskCache.queueingPool());
         });
+    }
+
+    public WatchService createWatchService() throws IOException {
+        boolean isMac = System.getProperty("os.name").toLowerCase().contains("mac");
+        if (isMac) {
+            return new MacOSXListeningWatchService(new MacOSXListeningWatchService.Config() {
+            });
+        } else {
+            return FileSystems.getDefault().newWatchService();
+        }
+    }
+
+    private void registerWatch(Path stepDirPath, WatchService w) throws IOException {
+        boolean isMac = System.getProperty("os.name").toLowerCase().contains("mac");
+        Watchable watchable = isMac ? new WatchablePath(stepDirPath) : stepDirPath;
+        watchable.register(w, StandardWatchEventKinds.ENTRY_CREATE);
     }
 
     private <T> CompletableFuture<TranspiledCacheEntry> getOrCreate(String step, Supplier<T> dependencies, BiFunction<T, TranspiledCacheEntry, TranspiledCacheEntry> work) {
@@ -384,6 +418,8 @@ public class CachedProject {
 
             CompilationLevel compilationLevel = CompilationLevel.fromString(config.getCompilationLevel());
 
+            LanguageMode languageOut = LanguageMode.fromString(config.getLanguageOut());
+
             //TODO pick another location if sourcemaps aren't going to be used
 
             File sources;
@@ -402,7 +438,6 @@ public class CachedProject {
             }
             reqs.stream().map(TranspiledCacheEntry::getTranspiledSourcesDir).map(File::getAbsoluteFile).distinct().forEach(dir -> {
                 try {
-                    // don't include the incremental.dat
                     FileUtils.copyDirectory(dir, sources, p -> !p.toString().endsWith("incremental.dat"));
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
@@ -427,6 +462,7 @@ public class CachedProject {
             boolean success = closureCompiler.compile(
                     compilationLevel,
                     config.getDependencyMode(),
+                    languageOut,
                     sources,
                     diskCache.getExtraJsZips(),
                     config.getEntrypoint(),
@@ -482,6 +518,7 @@ public class CachedProject {
         boolean success = closureCompiler.compile(
                 CompilationLevel.BUNDLE,
                 DependencyOptions.DependencyMode.SORT_ONLY,
+                LanguageMode.NO_TRANSPILE,
                 null,
                 diskCache.getExtraJsZips(),
                 Collections.emptyList(),
@@ -569,7 +606,6 @@ public class CachedProject {
                 throw new UncheckedIOException("Failed in copying output to webapp directory " + config.getWebappDirectory(), e);
             }
 
-
             try {
                 Gson gson = new GsonBuilder().setPrettyPrinting().create();
                 String scriptsArray = gson.toJson(Stream.concat(
@@ -633,7 +669,7 @@ public class CachedProject {
 
             //if no js sources exist, write an empty file and exit
             //TODO alternative to this lazy check of contents, enumerate the js files, and pass them directly to closure
-            try(DirectoryStream<Path> dirStream = Files.newDirectoryStream(ownSources.getTranspiledSourcesDir().toPath())) {
+            try (DirectoryStream<Path> dirStream = Files.newDirectoryStream(ownSources.getTranspiledSourcesDir().toPath())) {
                 if (!dirStream.iterator().hasNext()) {
                     Files.createFile(Paths.get(outputFile));
                     return entry;
@@ -655,6 +691,7 @@ public class CachedProject {
             boolean success = closureCompiler.compile(
                     CompilationLevel.BUNDLE,
                     DependencyOptions.DependencyMode.SORT_ONLY,
+                    LanguageMode.NO_TRANSPILE,
                     sources,
                     Collections.emptyList(),
                     Collections.emptyList(),
@@ -716,8 +753,6 @@ public class CachedProject {
             JsChecker checker = new JsChecker(upstreamExterns);
             // is not incremental, so passes all files.
             boolean success = checker.checkAndGenerateExterns(getFileInfoInDir(entry.getTranspiledSourcesDir().toPath(), false, jsMatcher), entry.getExternsFile());
-
-
             return entry;
         });
     }
@@ -736,12 +771,8 @@ public class CachedProject {
 //                    .collect(Collectors.toList()).stream()
                     .map(CompletableFuture::join)
                     .collect(Collectors.toList());
-
-
         }, (bytecodeDeps, entry) -> {
-//            List<SourceUtils.FileInfo> sourcesToCompile = getFileInfoInDir(Paths.get(entry.getStrippedSourcesDir().toURI()), javaMatcher);
-            List<SourceUtils.FileInfo> sourcesToCompile = getFileInfoInDir(Paths.get(entry.getStrippedSourcesDir().toURI()),
-                                                           true, javaMatcher);
+            List<SourceUtils.FileInfo> sourcesToCompile = getFileInfoInDir(Paths.get(entry.getStrippedSourcesDir().toURI()), true, javaMatcher);
             if (!sourcesToCompile.isEmpty()) {
                 //invoke j2cl on these sources, classpath
                 List<File> bytecodeClasspath = new ArrayList<>();
@@ -752,7 +783,9 @@ public class CachedProject {
                 bytecodeClasspath.addAll(diskCache.getExtraClasspath());
 
                 J2cl j2cl = new J2cl(bytecodeClasspath, diskCache.getBootstrap(), entry.getTranspiledSourcesDir(), hasSourcesMapped());
+
                 List<SourceUtils.FileInfo> nativeSources = getFileInfoInDir(entry.getStrippedSourcesDir().toPath(), true, nativeJsMatcher);
+
                 maybeAddNativeJs(sourcesToCompile, nativeSources);
 
                 boolean j2clSuccess = j2cl.transpile(sourcesToCompile, nativeSources);
@@ -770,7 +803,7 @@ public class CachedProject {
                     .forEach(path -> {
                         try {
                             Files.createDirectories(outSources.resolve(path).getParent());
-                            Files.copy(entry.getStrippedSourcesDir().toPath().resolve(path), outSources.resolve(path));
+                            Files.copy(entry.getStrippedSourcesDir().toPath().resolve(path), outSources.resolve(path), StandardCopyOption.REPLACE_EXISTING);
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
@@ -782,12 +815,18 @@ public class CachedProject {
 
     private void maybeAddNativeJs(List<SourceUtils.FileInfo> sourcesToCompile, List<SourceUtils.FileInfo> nativeSources) {
         for (SourceUtils.FileInfo path : sourcesToCompile) {
-            File maybeNativeJs = new File(path.toString().replaceAll("\\.java","\\.native.js"));
-            if(maybeNativeJs.exists() && !nativeSources.contains(maybeNativeJs.toPath())) {
-                //SourceUtils.FileInfo nativeJs = FrontendUtils.FileInfo.create(p.toString(), dir.toAbsolutePath().relativize(p).toString()
-                SourceUtils.FileInfo nativeJs = null;
-                nativeSources.add(nativeJs);
-                throw new UnsupportedOperationException("TODO");
+            File maybeNativeJs = new File(path.sourcePath().replaceAll("\\.java", "\\.native.js"));
+
+            if(maybeNativeJs.exists()) {
+                String sourcePath = path.sourcePath().replaceAll("\\.java", "\\.native.js");
+                String originalPath = path.originalPath().replaceAll("\\.java", "\\.native.js");
+                String targetPath = path.targetPath().replaceAll("\\.java", "\\.native.js");
+
+                SourceUtils.FileInfo nativeJsFile = SourceUtils.FileInfo.create(sourcePath, originalPath, targetPath);
+                if(!nativeSources.contains(nativeJsFile)) {
+                    nativeSources.add(nativeJsFile);
+                }
+
             }
         }
     }
@@ -812,8 +851,6 @@ public class CachedProject {
 //                    .collect(Collectors.toList()).stream()
                     .map(CompletableFuture::join)
                     .collect(Collectors.toList());
-
-
         }, (bytecodeDeps, entry) -> {
             //invoke javac on these sources, classpath
             List<File> strippedClasspath = new ArrayList<>(diskCache.getExtraClasspath());
@@ -822,7 +859,6 @@ public class CachedProject {
             // add itself, this is needed for incremental.
             // As .java takes classpath priority over .class, the shadowing should not be an issue.
             strippedClasspath.add(entry.getStrippedBytecodeDir());
-
 
             File strippedBytecode = entry.getStrippedBytecodeDir();
             try {
@@ -863,14 +899,11 @@ public class CachedProject {
             try {
                 List<String> dirsToStrip = new ArrayList<>();
                 if (hasSourcesMapped()) {
-//                    sourcesToStrip.addAll(getFileInfoInDir(entry.getAnnotationSourcesDir().toPath(), javaMatcher, nativeJsMatcher, jsMatcher));
-//                    sourcesToStrip.addAll(compileSourceRoots.stream().flatMap(dir -> getFileInfoInDir(Paths.get(dir), javaMatcher, nativeJsMatcher, jsMatcher).stream()).collect(Collectors.toList()));
                     dirsToStrip.addAll(compileSourceRoots);
                     dirsToStrip.add(entry.getAnnotationSourcesDir().toString());
                 } else {
+                    //unpack the jar's sources
                     File sources = entry.getUnpackedSources();
-
-                    dirsToStrip.add(sources.toString());
                     dirsToStrip.add(sources.toString());
 
                     //collect sources from jar instead
@@ -889,15 +922,13 @@ public class CachedProject {
                         }
                     }
                 }
-//                GwtIncompatiblePreprocessor stripper = new GwtIncompatiblePreprocessor(entry.getStrippedSourcesDir());
-//                stripper.preprocess(sourcesToStrip);
 
                 // For each added source jar, find the files and strip and output to stripped-sources
                 dirsToStrip.stream().forEach(dir -> {
                     Path dirPath = Paths.get(dir);
                     List<SourceUtils.FileInfo> sourcesToStrip = getFileInfoInDir(dirPath, true, javaMatcher, nativeJsMatcher, jsMatcher);
                     try {
-                        stripper.preprocess(dirPath.toFile(), sourcesToStrip);
+                        stripper.preprocess(dirPath, sourcesToStrip);
                     } catch (IOException e) {
                         throw new UncheckedIOException(e);
                     }
@@ -932,7 +963,7 @@ public class CachedProject {
                 List<File> plainClasspath = new ArrayList<>(diskCache.getExtraClasspath());
                 plainClasspath.addAll(reactorBytecode.stream().map(TranspiledCacheEntry::getBytecodeDir).collect(Collectors.toList()));
                 plainClasspath.addAll(children.stream()
-                                .filter(proj -> !proj.hasSourcesMapped())
+                                 .filter(proj -> !proj.hasSourcesMapped())
 //                        .filter(child -> new ScopeArtifactFilter(Artifact.SCOPE_COMPILE).include(child.getArtifact()))//TODO removing this is wrong, should instead let the whole "project" be scoped
                                 .map(CachedProject::getArtifact)
                                 .map(Artifact::getFile)
@@ -944,7 +975,9 @@ public class CachedProject {
 //                plainClasspath.addAll(compileSourceRoots.stream().map(File::new).collect(Collectors.toList()));
 
                 // This currently processes the annnotations for the entire project and compiles them (it is not incremental)
-                List<SourceUtils.FileInfo> sources = compileSourceRoots.stream().flatMap(dir -> getFileInfoInDir(Paths.get(dir), false, javaMatcher).stream()).collect(Collectors.toList());
+                List<SourceUtils.FileInfo> sources = compileSourceRoots.stream().flatMap(dir -> getFileInfoInDir(Paths.get(dir), false, javaMatcher).stream())
+                        .collect(Collectors.toList());
+
                 if (sources.isEmpty()) {
                     return entry;
                 }
@@ -990,7 +1023,6 @@ public class CachedProject {
                         }
                     }
                 }
-
                 //System.out.println("hash " + artifact.getArtifactId() + " : " + artifact.getVersion() + " : " + hash.toString() );
                 return diskCache.entry(getArtifactId(), hash.toString());
             } catch (IOException e) {
@@ -1000,17 +1032,8 @@ public class CachedProject {
         });
     }
 
-    static void copyFolder(File src, File dest){
-        try {
-            FileUtils.copyDirectory(src, dest);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        return;
-    }
-
     private void buildChangeSets(List<TranspiledCacheEntry> reactorBytecode, TranspiledCacheEntry entry) {
-        if(transpiledCacheEntry != null) {
+        if (transpiledCacheEntry != null) {
             TranspiledCacheEntry srcEntry = transpiledCacheEntry;
             Path srcBase = entry.getCacheDir().toPath();
             Path trgBase = entry.getCacheDir().toPath();
@@ -1019,7 +1042,6 @@ public class CachedProject {
 
             copyFolder(srcBase.resolve(srcEntry.getBytecodeDir().toPath()).toFile(),
                        trgBase.resolve(entry.getBytecodeDir().toPath()).toFile());
-
             copyFolder(srcBase.resolve(srcEntry.getTranspiledSourcesDir().toPath()).toFile(),
                        trgBase.resolve(entry.getTranspiledSourcesDir().toPath()).toFile());
 
@@ -1037,19 +1059,17 @@ public class CachedProject {
         try {
             typeGraphStore = new TypeGraphStore();
 
-            reactorBytecode.stream().forEach(e -> typeGraphStore.addAllToDelegate(e.getImpacting(), e.getUniqueIdToPath() ));
+            reactorBytecode.stream().forEach(e -> typeGraphStore.addAllToDelegate(e.getImpacting(), e.getUniqueIdToPath()));
             typeGraphStore.calculateChangeSet(entry.getTranspiledSourcesDir().toPath(), compileSourceRoots);
             typeGraphStore.write();
             // TODO generated sources here. They will always appear new each time, but that's ok, it helps keep the rest of the code simpler.
-
-
             // TODO don't hard code this to 1 ChangeSet (mdp)
             ChangeSet[] changeSets = typeGraphStore.getChangeSets().values().toArray(new ChangeSet[typeGraphStore.getChangeSets().size()]);
             ChangeSet changeSet = changeSets[0];
             for (String updated : changeSet.getUpdated()) {
-                if ( updated.endsWith(".native.js")) {
+                if (updated.endsWith(".native.js")) {
                     deleteNativeJsSource(entry, updated);
-                } else if ( updated.endsWith(".java")) {
+                } else if (updated.endsWith(".java")) {
                     deleteJavaSource(entry, updated);
                     String uniqueId = typeGraphStore.getPathToUniqueId().get(updated);
                     deleteInnerTypes(entry, updated, typeGraphStore.getInnerTypesChanged().get(uniqueId));
@@ -1061,9 +1081,9 @@ public class CachedProject {
             }
 
             for (String removed : changeSet.getRemoved()) {
-                if ( removed.endsWith(".native.js")) {
+                if (removed.endsWith(".native.js")) {
                     deleteNativeJsSource(entry, removed);
-                } else if ( removed.endsWith(".java")) {
+                } else if (removed.endsWith(".java")) {
                     deleteJavaSource(entry, removed);
                     String uniqueId = typeGraphStore.getPathToUniqueId().get(removed);
                     deleteInnerTypes(entry, removed, typeGraphStore.getInnerTypesChanged().get(uniqueId));
@@ -1108,7 +1128,7 @@ public class CachedProject {
         boolean b1 = Files.deleteIfExists(javaPath); // this won't exist for inner types, but that's ok
 
         String baseFileName = file.substring(0, file.length() - 5);
-        Path   bytecodPath  = entry.getBytecodeDir().toPath().resolve(baseFileName + ".class");
+        Path bytecodPath = entry.getBytecodeDir().toPath().resolve(baseFileName + ".class");
         boolean b2 = Files.deleteIfExists(bytecodPath);
 
         Path javaJsPath = entry.getTranspiledSourcesDir().toPath().resolve(baseFileName + ".java.js");
@@ -1125,35 +1145,6 @@ public class CachedProject {
         System.out.println("Delete: " + b3 + ":" + javaJsPath);
         System.out.println("Delete: " + b4 + ":" + implJavaJsPath);
         System.out.println("Delete: " + b5 + ":" + jsMap);
-    }
-
-    private static void appendHashOfAllSources(Hash hash, Path rootDirectory) throws IOException {
-        // TODO filter to only source files - probably will just blacklist .class files?
-
-        // If no sources are found, we still need to consider this as a provided classpath item, but the
-        // stripped jar will be empty, etc
-        Files.walkFileTree(rootDirectory, new FileVisitor<Path>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path path, BasicFileAttributes basicFileAttributes) throws IOException {
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path path, BasicFileAttributes basicFileAttributes) throws IOException {
-                hash.append(Files.readAllBytes(path));
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFileFailed(Path path, IOException e) throws IOException {
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult postVisitDirectory(Path path, IOException e) throws IOException {
-                return FileVisitResult.CONTINUE;
-            }
-        });
     }
 
     private List<SourceUtils.FileInfo> getFileInfoInDir(Path dir, boolean useTypeStoreMatcher, PathMatcher... matcher) {
@@ -1184,15 +1175,28 @@ public class CachedProject {
                 typeStoreMatcher = null;
             }
 
-//            return Files.find(dir, Integer.MAX_VALUE, ((path, basicFileAttributes) -> Arrays.stream(matcher).anyMatch(m -> m.matches(path)
-//                                                                                                                           && (typeStoreMatcher == null || typeStoreMatcher.matches(path)))))
-//                        .map(p -> FrontendUtils.FileInfo.create(p.toString(), dir.toAbsolutePath().relativize(p).toString()))
-//                        .collect(Collectors.toList());
-            throw new IOException("TODO");
+            return Files.find(dir, Integer.MAX_VALUE, ((path, basicFileAttributes) -> Arrays.stream(matcher).anyMatch(m -> m.matches(path)
+                    && (typeStoreMatcher == null || typeStoreMatcher.matches(path)))))
+                                    .map(p -> SourceUtils.FileInfo.create(p.toString(), dir.toAbsolutePath().relativize(p).toString()))
+                                    .collect(Collectors.toList());
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
+    private enum Step {
+        Hash,
+        ChangeSet,
+        ProcessAnnotations,
+        StripGwtIncompatible,
+        GenerateStrippedBytecode,
+        TranspileSources,
 
+        AssembleOutput,
+
+        // these names could be clearer
+        JsChecker,
+        ProjectBundle,
+        ChunkBundle,
+    }
 }

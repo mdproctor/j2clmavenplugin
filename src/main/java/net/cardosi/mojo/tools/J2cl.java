@@ -18,9 +18,6 @@ public class J2cl {
     private final J2clTranspilerOptions.Builder optionsBuilder;
 
     public J2cl(List<File> strippedClasspath, File bootstrap, File jsOutDir, boolean writeTypeGraph) {
-//        if (writeTypeGraph) {
-//            args.add("-writeTypeGraph");
-//        }
         optionsBuilder = J2clTranspilerOptions.newBuilder()
                 .setFrontend(Frontend.JDT)
                 .setBackend(Backend.CLOSURE)

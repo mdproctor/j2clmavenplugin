@@ -1,7 +1,7 @@
 package net.cardosi.mojo.cache;
 
-import net.cardosi.mojo.ClosureBuildConfiguration;
 import com.google.j2cl.transpiler.incremental.TypeInfo;
+import net.cardosi.mojo.ClosureBuildConfiguration;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -10,18 +10,16 @@ import java.util.List;
 import java.util.Map;
 
 public class TranspiledCacheEntry {
-    private final String              hash;
-    private final String              artifactId;
-    private final File                cacheDir;
-    private final List<TypeInfo>      impacting;
-    private final Map<String, String> uniqueIdToPath;
+    private final String hash;
+    private final String artifactId;
+    private final File cacheDir;
+    private final List<TypeInfo> impacting = new ArrayList<>();
+    private final Map<String, String> uniqueIdToPath = new HashMap<>();
 
     public TranspiledCacheEntry(String hash, String artifactId, File cacheDir) {
         this.hash = hash;
         this.artifactId = artifactId;
         this.cacheDir = cacheDir;
-        this.impacting = new ArrayList<>();
-        this.uniqueIdToPath = new HashMap<>();
     }
 
     public String getHash() {

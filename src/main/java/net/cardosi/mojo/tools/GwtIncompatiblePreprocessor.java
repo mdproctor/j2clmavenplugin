@@ -1,15 +1,16 @@
 package net.cardosi.mojo.tools;
 
-import com.google.j2cl.common.Problems;
-import com.google.common.io.MoreFiles;
-import com.google.j2cl.common.SourceUtils;
-
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+
+import com.google.common.io.MoreFiles;
+import com.google.j2cl.common.Problems;
+import com.google.j2cl.common.SourceUtils;
 
 import static com.google.j2cl.tools.gwtincompatible.GwtIncompatibleStripper.strip;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -19,6 +20,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * annotated with @GwtIncompatible
  */
 public class GwtIncompatiblePreprocessor {
+
     private final File outputDirectory;
 
     public GwtIncompatiblePreprocessor(File outputDirectory) {
@@ -28,13 +30,13 @@ public class GwtIncompatiblePreprocessor {
         }
     }
 
-    public void preprocess(File sourceDir, List<SourceUtils.FileInfo> unprocessedFiles) throws IOException {
+    public void preprocess(Path sourceDir, List<SourceUtils.FileInfo> unprocessedFiles) throws IOException {
         Problems problems = new Problems();
 
         //System.out.println("strip sourceDir" + sourceDir);
-        for (SourceUtils.FileInfo fileInfo : unprocessedFiles) {
-            Path file = Paths.get(fileInfo.originalPath());
-            Path localPath = sourceDir.toPath().relativize(file);
+        for (SourceUtils.FileInfo f : unprocessedFiles) {
+            Path file = new File(f.sourcePath()).toPath();
+            Path localPath = sourceDir.relativize(file);
             final Path targetPath = outputDirectory.toPath().resolve(localPath);
             Files.createDirectories(targetPath.getParent());
             Files.deleteIfExists(targetPath);

@@ -103,6 +103,13 @@ public class TestMojo extends AbstractBuildMojo implements ClosureBuildConfigura
     @Parameter(defaultValue = CachedProject.BUNDLE_JAR, property = "compilationLevel")
     protected String compilationLevel;
 
+    /**
+     * ECMAScript language level of generated JavasScript. Values correspond to the Closure Compiler reference:
+     * https://github.com/google/closure-compiler/wiki/Flags-and-Options
+     */
+    @Parameter(defaultValue = "ECMASCRIPT5", property = "languageOut")
+    protected String languageOut;
+
     @Parameter
     protected Map<String, String> defines = new TreeMap<>();
 
@@ -190,7 +197,7 @@ public class TestMojo extends AbstractBuildMojo implements ClosureBuildConfigura
 
         try {
             // Build the dependency tree for the project itself. Note that this picks up the scope of the test side of things, but uses the app sources, which isn't exactly right.
-            CachedProject source = loadDependenciesIntoCache(project.getArtifact(), project, false, projectBuilder, request, diskCache, pluginVersion, projects, Artifact.SCOPE_TEST, getDependencyReplacements(), "* ");
+            CachedProject source = loadDependenciesIntoCache(project.getArtifact(), project, true, projectBuilder, request, diskCache, pluginVersion, projects, Artifact.SCOPE_TEST, getDependencyReplacements(), "* ");
 
             // Given that set of tasks, we'll chain one more on the end - this is the one that will have the actual test sources+resources. To be fully correct,
             // only this should have the scope=test deps on it
@@ -454,6 +461,11 @@ public class TestMojo extends AbstractBuildMojo implements ClosureBuildConfigura
     }
 
     @Override
+    public String getLanguageOut() {
+        return languageOut;
+    }
+
+    @Override
     public DependencyOptions.DependencyMode getDependencyMode() {
         return DependencyOptions.DependencyMode.valueOf(dependencyMode);
     }
@@ -524,6 +536,11 @@ public class TestMojo extends AbstractBuildMojo implements ClosureBuildConfigura
         @Override
         public String getCompilationLevel() {
             return wrapped.getCompilationLevel();
+        }
+
+        @Override
+        public String getLanguageOut() {
+            return wrapped.getLanguageOut();
         }
 
         @Override
